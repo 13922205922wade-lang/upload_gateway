@@ -277,7 +277,7 @@ document.querySelector('button.confirm-publish').addEventListener('click', ()=>{
     fetch('https://www.ximalaya.com/reform-upload/upload/create', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
-        albumId: 131894089, visibleCrowdType: 1, isAiTrack: true,
+        albumId: 999000001, visibleCrowdType: 1, isAiTrack: true,  // 测试夹具：虚构 ID
         soundTitle: titleEl ? titleEl.value : '',
         lrcPath: window.__lrcSubmitted
           ? 'http://fdfs.xmcdn.com/storages/test/lrc.json' : ''
