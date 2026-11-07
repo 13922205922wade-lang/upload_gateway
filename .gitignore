@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 打包产物
+*.app/
+build/
+dist/
+
+# 运行期数据：登录态 / 断点状态 / 日志 / 套包（含账号信息，绝不入库）
+profiles/
+state/
+logs/
+packages/
+_work/
+*.log
+
+# 本地工作记忆：含账号 UID、专辑 ID 与内部调研笔记
+.workbuddy/
+
+# macOS
+.DS_Store
+
+# 打包过程中的临时保留目录
+.build_keep/
