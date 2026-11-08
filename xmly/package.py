@@ -3,12 +3,21 @@
 负责把制作端产出的交付套包目录（例如 oz01a-ximalaya-zh-CN-r0003）解析成
 结构化的上传计划：章节列表、音频资产、字幕轨、插图资产。
 
-套包约定（见 manifest.json 的 schema 字段 ximalaya-picture-audiobook/v1）:
+套包约定（见 manifest.json 的 schema 字段）:
+
+1) ximalaya-picture-audiobook/v1 —— 制作端交付包
   manifest.json
   chapters/<chNN>/<chNN>.mp3   音频
   chapters/<chNN>/<chNN>.srt   字幕（中英单语时间轴）
   chapters/<chNN>/<chNN>.lrc   双语时间轨（同时间戳中文行 + 英文行）
   chapters/<chNN>/images/*.jpg 插图
+
+2) oz-reviewed-category-zip/v1 —— 审核分类包（目录或 .zip）
+  manifest.json 里只有一个 files[] 清单：
+      {chapter, archive_path, source, sha256, bytes}
+  chNN/<zh|en>.mp3 + chNN/<zh|en>.lrc，没有标题 / 时长 / 插图。
+  解析时把 files[] 归一化成 1) 的 chapters[]，并从就近的旧交付包或 LRC
+  里把章节标题、时长、AI 合成标记补回来（见 _normalize_reviewed_manifest）。
 """
 
 from __future__ import annotations
@@ -16,14 +25,26 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from .paths import data_dir
+
 SCHEMA_PREFIX = "ximalaya-picture-audiobook"
+REVIEWED_SCHEMA_PREFIX = "oz-reviewed-category-zip"
+SUPPORTED_SCHEMAS = (SCHEMA_PREFIX, REVIEWED_SCHEMA_PREFIX)
 
 # LRC 时间戳：[mm:ss.xx] 或 [mm:ss.xxx] 或 [hh:mm:ss.xx]
 _LRC_TIME = re.compile(r"^\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\](.*)$")
+# 审核包里可能出现三段式 [hh:mm:ss.mmm]，扫描标题/时长时用
+_LRC_LINE = re.compile(
+    r"^\[(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?\]\s*(.*)$"
+)
+_CHAPTER_TITLE_RE = re.compile(r"^第\s*\d+\s*章[\s　]*\S")
+_FRONT_MATTER = ("欢迎", "奥兹系列", "有声书", "请", "搜索", "本书", "系列")
 # 中日韩统一表意文字（含扩展A）
 _CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 # 拉丁字母
@@ -129,6 +150,7 @@ class Package:
     manifest: dict
     chapters: list[Chapter]
     manifest_sha256: str = ""
+    origin: Path | None = None  # 由 .zip 导入时，记着原始 zip 路径
 
     @property
     def title(self) -> str:
@@ -294,9 +316,285 @@ def parse_bilingual_lrc(path: Path) -> tuple[SubtitleTrack, SubtitleTrack]:
     return zh, en
 
 
+def _safe_rel(rel: str) -> str:
+    """校验 manifest / ZIP 里的相对路径，挡住 ../ 与绝对路径。"""
+    rel = str(rel).strip().replace("\\", "/")
+    p = Path(rel)
+    if not rel or p.is_absolute() or rel.startswith("/") or ".." in p.parts:
+        raise PackageError(f"套包里有不安全的路径：{rel}")
+    return rel
+
+
+def _zip_has_manifest(path: Path) -> bool:
+    """自动发现时判断一个 .zip 是不是套包（只读目录表，不解压）。"""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return any(
+                Path(n).name == "manifest.json"
+                and n.count("/") <= 1
+                and not n.startswith("__MACOSX")
+                for n in zf.namelist()
+            )
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
+def _expand_zip(zip_path: Path) -> Path:
+    """把审核包 ZIP 展开到运行期缓存；manifest 不变就复用，不重复解压。
+
+    上传需要真实的本地音频路径，所以 ZIP 必须落盘。缓存放在运行期数据目录
+    （打包版是 ~/Library/Application Support/...），不进 bundle、不进仓库。
+    """
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise PackageError(f"不是有效的套包 ZIP：{exc}") from exc
+
+    with zf:
+        names = {n for n in zf.namelist() if not n.endswith("/")}
+        manifest_name = next(
+            (
+                n
+                for n in sorted(names)
+                if Path(n).name == "manifest.json"
+                and n.count("/") <= 1
+                and not n.startswith("__MACOSX")
+            ),
+            None,
+        )
+        if manifest_name is None:
+            raise PackageError(f"ZIP 里没有 manifest.json：{zip_path.name}")
+        if ".." in Path(manifest_name).parts or manifest_name.startswith("/"):
+            raise PackageError(f"ZIP 里 manifest 路径不安全：{manifest_name}")
+        prefix = manifest_name[: -len("manifest.json")]
+        raw = zf.read(manifest_name)
+        try:
+            manifest = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PackageError(f"ZIP 内 manifest.json 解析失败：{exc}") from exc
+
+        rels = [
+            _safe_rel(f.get("archive_path") or "")
+            for f in (manifest.get("files") or [])
+            if isinstance(f, dict)
+        ]
+        needed = set(rels)
+        if "README.txt" in names:
+            needed.add("README.txt")
+
+        tag = hashlib.sha256(raw).hexdigest()[:12]
+        dest = data_dir() / "expanded_packages" / f"{zip_path.stem}-{tag}"
+        expected = [dest / "manifest.json", *(dest / r for r in rels)]
+        if all(p.is_file() for p in expected):
+            return dest
+
+        dest.mkdir(parents=True, exist_ok=True)
+        for rel in sorted(needed):
+            src_name = prefix + rel
+            if src_name not in names:
+                continue
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(src_name) as src, target.open("wb") as out:
+                shutil.copyfileobj(src, out, 1 << 20)
+        (dest / "manifest.json").write_bytes(raw)
+
+        missing = [str(p) for p in expected if not p.is_file()]
+        if missing:
+            raise PackageError(f"ZIP 解包后缺少文件：{', '.join(missing[:5])}")
+    return dest
+
+
+def _reviewed_language(manifest: dict, rels: list[str]) -> str:
+    """审核包没有 language 字段：从 category / 文件名推断。"""
+    category = str(manifest.get("category") or "").lower()
+    if "zh" in category:
+        return "zh-CN"
+    if "en" in category:
+        return "en-US"
+    for rel in rels:
+        stem = Path(rel).stem.lower()
+        if stem in ("zh", "zh-cn", "zh-hans"):
+            return "zh-CN"
+        if stem in ("en", "en-us"):
+            return "en-US"
+    return "zh-CN"
+
+
+def _lrc_scan(path: Path | None) -> tuple[str, float]:
+    """从审核包 LRC 里捞章节标题 + 近似时长（最后一个时间戳）。"""
+    if not path or not path.is_file():
+        return "", 0.0
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return "", 0.0
+
+    title = ""
+    short: list[str] = []
+    max_ms = 0
+    for i, raw in enumerate(lines):
+        m = _LRC_LINE.match(raw.strip())
+        if not m:
+            continue
+        hours, minutes, seconds, frac, text = m.groups()
+        ms = (
+            int(hours or 0) * 3600000
+            + int(minutes) * 60000
+            + int(seconds) * 1000
+            + int((frac or "0").ljust(3, "0"))
+        )
+        max_ms = max(max_ms, ms)
+        text = text.strip()
+        if i >= 40 or not text:
+            continue
+        if _CHAPTER_TITLE_RE.match(text) and not title:
+            title = text
+        elif (
+            2 <= len(text) <= 16
+            and not any(c in text for c in "，。,.!?；;：:")
+            and not any(w in text for w in _FRONT_MATTER)
+        ):
+            short.append(text)
+    return title or (short[0] if short else ""), round(max_ms / 1000, 3)
+
+
+def _sibling_metadata(root: Path, origin: Path | None, manifest: dict) -> dict:
+    """审核包没有书名 / 章节标题 / AI 标记，就近找同一本书的旧交付包借。
+
+    审核包的 source 字段指向 dist/.../r0004/...，材料目录里通常就摆着那份
+    交付包；借它的标准章节标题能保证「平台已有同名章节」的去重逻辑仍然有效。
+    找不到也不报错 —— LRC 启发式与兜底标题会接上。
+    """
+    category = str(manifest.get("category") or "").lower()
+    hint = "en" if ("en" in category and "zh" not in category) else "zh"
+    bases: list[Path] = []
+    for base in (
+        origin.parent if origin else None,
+        root.parent,
+        root.parent.parent,
+    ):
+        if base and base.is_dir() and base not in bases:
+            bases.append(base)
+
+    candidates: list[tuple[int, dict]] = []
+    for base in bases:
+        files = [base / "manifest.json", *sorted(base.glob("*/manifest.json"))]
+        for mf in files[:40]:
+            if not mf.is_file():
+                continue
+            try:
+                data = json.loads(mf.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            chapters = data.get("chapters")
+            if not isinstance(chapters, list) or not chapters:
+                continue
+            name = mf.parent.name.lower()
+            score = 3 if (hint == "en" and "en-us" in name) or (hint == "zh" and "zh-cn" in name) else 1
+            candidates.append((score, data))
+    if not candidates:
+        return {}
+    best = max(candidates, key=lambda pair: pair[0])[1]
+    titles = {
+        str(c.get("id")): str(c.get("title") or "")
+        for c in best["chapters"]
+        if isinstance(c, dict) and c.get("id")
+    }
+    return {
+        "titles": titles,
+        "title": best.get("title") or "",
+        "author": best.get("author") or "",
+        "source": best.get("source") or {},
+    }
+
+
+def _normalize_reviewed_manifest(root: Path, manifest: dict, origin: Path | None) -> dict:
+    """把 oz-reviewed-category-zip 的 files[] 归一化成标准 chapters[]。"""
+    files = [f for f in (manifest.get("files") or []) if isinstance(f, dict)]
+    if not files:
+        raise PackageError("审核套包的 manifest.json 里没有 files[]")
+
+    grouped: dict[str, dict] = {}
+    order: list[str] = []
+    for f in files:
+        cid = str(f.get("chapter") or "").strip()
+        rel = _safe_rel(f.get("archive_path") or "")
+        if not cid:
+            continue
+        if cid not in grouped:
+            grouped[cid] = {}
+            order.append(cid)
+        info: dict = {"path": rel}
+        if f.get("sha256"):
+            info["sha256"] = f["sha256"]
+        if f.get("bytes"):
+            info["bytes"] = f["bytes"]
+        ext = Path(rel).suffix.lower()
+        if ext in (".mp3", ".m4a", ".wav", ".aac"):
+            grouped[cid]["audio"] = info
+        elif ext == ".lrc":
+            grouped[cid]["lrc"] = info
+        elif ext == ".srt":
+            grouped[cid]["srt"] = info
+    if not order:
+        raise PackageError("审核套包的 files[] 里没有可用章节")
+
+    rels = [str(f.get("archive_path") or "") for f in files]
+    meta = _sibling_metadata(root, origin, manifest)
+    titles = meta.get("titles") or {}
+    book = str(manifest.get("book") or root.name)
+    category = str(manifest.get("category") or "")
+    recorded = str((manifest.get("user_acceptance") or {}).get("recorded_at") or "")[:10]
+
+    chapters: list[dict] = []
+    for idx, cid in enumerate(order, 1):
+        item = grouped[cid]
+        if "audio" not in item:
+            raise PackageError(f"审核套包 {cid} 缺少音频文件")
+        lrc_rel = item.get("lrc", {}).get("path")
+        scanned, seconds = _lrc_scan(root / lrc_rel) if lrc_rel else ("", 0.0)
+        title = titles.get(cid) or scanned
+        if title and not _CHAPTER_TITLE_RE.match(title):
+            title = f"第{idx}章　{title}"  # LRC 里只有短标题（如「龙卷风」）时补章号
+        raw: dict = {
+            "id": cid,
+            "title": title or f"第{idx}章",
+            "duration_seconds": seconds,
+            "audio": item["audio"],
+            "images": [],
+        }
+        if "lrc" in item:
+            raw["lrc"] = item["lrc"]
+        if "srt" in item:
+            raw["subtitles"] = {"srt": item["srt"]}
+        chapters.append(raw)
+
+    normalized = dict(manifest)  # 保留审计 / 来源信息
+    normalized.update(
+        {
+            "title": f"{book} {category} · 审核版".strip(),
+            "author": meta.get("author", ""),
+            "language": _reviewed_language(manifest, rels),
+            "version": f"reviewed-{recorded}" if recorded else "reviewed",
+            "identifier": f"oz-reviewed/{book}-{category}" if category else f"oz-reviewed/{book}",
+            "product_id": f"oz-reviewed/{book}-{category}" if category else f"oz-reviewed/{book}",
+            "source": meta.get("source") or {},
+            "reviewed_package": True,
+            "chapters": chapters,
+        }
+    )
+    return normalized
+
+
 def parse_package(root: str | Path, *, verify_hash: bool = False) -> Package:
-    """解析套包目录，返回 Package。"""
-    root = Path(root).expanduser().resolve()
+    """解析套包目录或审核包 ZIP，返回 Package。"""
+    root = Path(root).expanduser()
+    origin: Path | None = None
+    if root.is_file() and root.suffix.lower() == ".zip":
+        origin = root.resolve()
+        root = _expand_zip(origin)
+    root = root.resolve()
     if not root.is_dir():
         raise PackageError(f"套包目录不存在：{root}")
 
@@ -311,8 +609,10 @@ def parse_package(root: str | Path, *, verify_hash: bool = False) -> Package:
         raise PackageError(f"manifest.json 解析失败：{exc}") from exc
 
     schema = manifest.get("schema", "")
-    if schema and not schema.startswith(SCHEMA_PREFIX):
+    if schema and not any(schema.startswith(p) for p in SUPPORTED_SCHEMAS):
         raise PackageError(f"不支持的套包 schema：{schema}")
+    if schema.startswith(REVIEWED_SCHEMA_PREFIX):
+        manifest = _normalize_reviewed_manifest(root, manifest, origin)
 
     raw_chapters = manifest.get("chapters") or []
     if not raw_chapters:
@@ -327,6 +627,7 @@ def parse_package(root: str | Path, *, verify_hash: bool = False) -> Package:
         manifest=manifest,
         chapters=chapters,
         manifest_sha256=hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+        origin=origin,
     )
 
 
@@ -514,12 +815,17 @@ def summarize(pkg: Package) -> str:
     mb = pkg.total_bytes / 1024 / 1024
     mins = pkg.total_duration / 60
     version = f"　版本：{pkg.version}" if pkg.version else ""
-    return (
-        f"{pkg.title}\n"
-        f"作者：{pkg.author}　语言：{pkg.language}{version}\n"
-        f"章节：{len(pkg.chapters)}　总时长：{mins:.1f} 分钟　音频合计：{mb:.1f} MB\n"
-        f"标识：{pkg.identifier or pkg.product_id}"
-    )
+    lines = [
+        pkg.title,
+        f"作者：{pkg.author}　语言：{pkg.language}{version}",
+        f"章节：{len(pkg.chapters)}　总时长：{mins:.1f} 分钟　音频合计：{mb:.1f} MB",
+        f"标识：{pkg.identifier or pkg.product_id}",
+    ]
+    if pkg.manifest.get("reviewed_package"):
+        lines.append("格式：审核分类包（无插图，章节标题 / 时长 / AI 标记已自动补全）")
+    if pkg.origin:
+        lines.append(f"来源 ZIP：{pkg.origin.name}（已展开到 {pkg.root}）")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -553,13 +859,18 @@ def find_packages(
         root = Path(root).expanduser()
         if not root.is_dir():
             continue
-        for cand in _walk_dirs(root, max_depth):
-            if cand in seen:
+        # root 自身也算一层；审核包可能是目录，也可能是 .zip
+        for cand in (root, *_walk_dirs(root, max_depth)):
+            if "expanded_packages" in cand.parts:  # ZIP 解压缓存，不是源套包
                 continue
-            if not (cand / "manifest.json").is_file():
-                continue
-            seen.add(cand)
-            found.append(cand)
+            if cand not in seen and (cand / "manifest.json").is_file():
+                seen.add(cand)
+                found.append(cand)
+            for z in sorted(cand.glob("*.zip")):
+                if z in seen or not _zip_has_manifest(z):
+                    continue
+                seen.add(z)
+                found.append(z)
     found.sort(
         key=lambda p: (_release_rank(p.name), 1 if "zh" in p.name.lower() else 0, p.name),
         reverse=True,
@@ -598,3 +909,36 @@ def latest_package(
     """最新的一个套包目录（找不到返回 None）。"""
     pkgs = find_packages(roots)
     return pkgs[0] if pkgs else None
+
+
+def find_reviewed_packages(roots: Iterable[str | Path] | None = None) -> list[Path]:
+    """找出审核分类包（目录或 ZIP），供界面提示用户「有新套包可导入」。
+
+    默认套包仍按发布号排序（r0004 优先），不会自作主张换成审核包 ——
+    换套包可能影响断点续传和专辑归属，必须让用户明确选择。
+    """
+    out: list[Path] = []
+    for path in find_packages(roots):
+        schema = ""
+        try:
+            if path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(path) as zf:
+                    name = next(
+                        (
+                            n
+                            for n in zf.namelist()
+                            if Path(n).name == "manifest.json" and n.count("/") <= 1
+                        ),
+                        None,
+                    )
+                    if name:
+                        schema = json.loads(zf.read(name).decode("utf-8")).get("schema", "")
+            else:
+                schema = json.loads(
+                    (path / "manifest.json").read_text(encoding="utf-8")
+                ).get("schema", "")
+        except (OSError, ValueError, zipfile.BadZipFile):
+            continue
+        if str(schema).startswith(REVIEWED_SCHEMA_PREFIX):
+            out.append(path)
+    return out

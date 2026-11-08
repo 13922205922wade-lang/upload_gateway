@@ -17,6 +17,9 @@ packages/
 _work/
 *.log
 
+# ZIP 套包解压缓存（可能几百 MB，且是运行期数据）
+expanded_packages/
+
 # 本地工作记忆：含账号 UID、专辑 ID 与内部调研笔记
 .workbuddy/
 

@@ -119,6 +119,36 @@ python run.py --no-landing
 
 ---
 
+## 审核分类包（oz-reviewed-category-zip/v1）
+
+制作端从 2026-11 起还会交付「审核分类包」：一个目录，或直接一个 `.zip`。
+它的 `manifest.json` 只有一个 `files[]` 清单（chapter / archive_path /
+sha256 / bytes），素材是 `chNN/<zh|en>.mp3` + `chNN/<zh|en>.lrc`，
+**没有** `chapters[]`、章节标题、时长、语言和插图。旧版工具会直接弹
+「不支持的套包 schema」，现在会自动归一化成标准 `chapters[]`：
+
+- 按 `files[]` 还原每章音频 / LRC 路径、字节数与 SHA-256；
+- 章节标题优先借同书旧交付包（r0004）的标准标题，其次从 LRC 提取
+  （「第1章 龙卷风」，或短标题「龙卷风」→ 补成「第1章　龙卷风」）；
+- 语言由 category / 文件名推断（A_zh → zh-CN，A_en → en-US）；
+  时长取 LRC 最后一个时间戳；「是否AI合成」沿用旧交付包的 `source.model`；
+- `package_key` 是 `oz-reviewed/<book>-<category>@reviewed-<日期>`，
+  与旧套包的断点状态互不混淆，不会误跳过、也不会重复计。
+
+怎么用：
+
+- **目录**：点「浏览…」选到含 `manifest.json` 的那个目录；
+- **ZIP**：点「导入 ZIP」直接选 `.zip`，工具展开到
+  `~/Library/Application Support/喜马拉雅有声书工具/expanded_packages/`
+  （按 manifest 内容寻址，同一份只展开一次；不进 `.app`、不进仓库）；
+- 启动时日志会提示检测到的审核包，但**默认套包仍按发布号排序（r0004 优先）**，
+  不会擅自切换 —— 换套包会牵动断点续传和专辑归属，必须由你明确选择。
+
+审核包没有插图，章节列表「插图」列显示 0 是正常的；上传链路本来就不依赖章节插图。
+ZIP 里的路径会做 `../` 校验，防止压缩包把文件写到缓存目录之外。
+
+---
+
 ## 它解决的问题
 
 | 痛点 | 处理方式 |

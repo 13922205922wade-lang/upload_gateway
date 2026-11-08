@@ -41,6 +41,7 @@ from .package import (
     Package,
     PackageError,
     find_packages,
+    find_reviewed_packages,
     latest_package,
     parse_package,
     summarize,
@@ -124,6 +125,8 @@ class App(ttk.Frame):
         self.after(300, self._auto_load_package)
         # 启动后自动检测登录态：用户一打开就知道能不能传，不用手动点
         self.after(600, self._auto_check_login)
+        # 有新的审核分类包时给个提示，别让人对着旧默认套包发愣
+        self.after(1000, self._hint_reviewed_packages)
         self._log(describe())
         if moved:
             self._log(f"已将旧位置的运行期数据（{moved}）搬到 {data_dir()}")
@@ -135,11 +138,32 @@ class App(ttk.Frame):
         这一步自动做掉最省事；解析失败也只是在日志里提示，不打断界面。
         """
         raw = self.path_var.get().strip()
-        if not raw or not Path(raw).is_dir():
-            self._log(f"⚠ 默认套包目录不存在：{raw}", "warn")
-            self._log("    请点「浏览…」选择一个含 manifest.json 的套包目录", "warn")
+        path = Path(raw).expanduser() if raw else None
+        valid = bool(path) and (
+            path.is_dir() or (path.is_file() and path.suffix.lower() == ".zip")
+        )
+        if not valid:
+            self._log(f"⚠ 默认套包不存在：{raw}", "warn")
+            self._log(
+                "    请点「浏览…」选套包目录，或点「导入 ZIP」选审核包 ZIP", "warn"
+            )
             return
         self._load_package()
+
+    def _hint_reviewed_packages(self) -> None:
+        """启动后提示「检测到新的审核分类包」，但不擅自切换默认套包。"""
+        try:
+            found = find_reviewed_packages()
+        except Exception:  # noqa: BLE001 —— 提示失败不该影响主流程
+            return
+        if not found:
+            return
+        self._log(f"💡 检测到 {len(found)} 个审核分类包，可直接导入：", "info")
+        for p in found[:3]:
+            self._log(f"    {p}", "info")
+        self._log(
+            "    点「导入 ZIP」或「浏览…」选择即可；默认套包保持不变", "info"
+        )
 
     def _auto_check_login(self) -> None:
         """启动时静默检测登录态（不弹窗、不打断）。"""
@@ -226,6 +250,9 @@ class App(ttk.Frame):
         ttk.Button(pkg_box, text="浏览…", command=self._choose_dir).grid(row=0, column=2)
         ttk.Button(pkg_box, text="解析", command=self._load_package).grid(
             row=0, column=3, padx=(8, 0)
+        )
+        ttk.Button(pkg_box, text="导入 ZIP", command=self._choose_zip).grid(
+            row=0, column=4, padx=(8, 0)
         )
 
         self.pkg_info = ttk.Label(pkg_box, text="尚未加载套包", style="Sub.TLabel")
@@ -448,10 +475,30 @@ class App(ttk.Frame):
     # ------------------------------------------------------------------ 套包
 
     def _choose_dir(self) -> None:
-        d = filedialog.askdirectory(initialdir=self.path_var.get() or str(Path.home()))
+        d = filedialog.askdirectory(initialdir=self._package_initial_dir())
         if d:
             self.path_var.set(d)
             self._load_package()
+
+    def _choose_zip(self) -> None:
+        """直接选审核分类包 ZIP（工具会自动展开到运行期缓存）。"""
+        f = filedialog.askopenfilename(
+            title="选择套包 ZIP（oz-reviewed-category-zip）",
+            initialdir=self._package_initial_dir(),
+            filetypes=[("套包 ZIP", "*.zip"), ("所有文件", "*")],
+        )
+        if f:
+            self.path_var.set(f)
+            self._load_package()
+
+    def _package_initial_dir(self) -> str:
+        raw = self.path_var.get().strip()
+        path = Path(raw).expanduser() if raw else None
+        if path and path.is_dir():
+            return str(path)
+        if path and path.parent.is_dir():
+            return str(path.parent)
+        return str(Path.home())
 
     def _set_package_path(self, path: Path) -> None:
         self.path_var.set(str(path))
@@ -460,6 +507,9 @@ class App(ttk.Frame):
         raw = self.path_var.get().strip()
         if not raw:
             return
+        if raw.lower().endswith(".zip"):
+            self._log("正在展开 ZIP 套包（首次会解压音频，稍等）…", "info")
+            self.update_idletasks()
         try:
             pkg = parse_package(raw)
         except PackageError as exc:
@@ -478,7 +528,9 @@ class App(ttk.Frame):
             self.album_var.set(pkg.title)
         self._last_pkg_title = pkg.title
 
-        summary_text = summarize(pkg).replace("\n", "　|　")
+        # 摘要栏只放核心三行（审核包 / ZIP 还会多两行说明，放日志里，
+        # 否则单行 Label 会被窗口截断），完整摘要始终写进日志。
+        summary_text = "　|　".join(summarize(pkg).splitlines()[:3])
         self.pkg_info.configure(text=summary_text)
         self._log(summarize(pkg), "ok")
         self._log(f"套包版本：{pkg.package_key}　内容指纹：{pkg.fingerprint}", "info")
